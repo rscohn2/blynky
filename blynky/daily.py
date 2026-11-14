@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from slugify import slugify
 
@@ -51,15 +52,29 @@ def location_key(name):
     return f"{_LOCATION}{slugify(name)}"
 
 
-def _local(stamp):
-    """Return a capture's time in the server's time zone, or None."""
+def zone_for(tz_name):
+    """Return a ZoneInfo for a timezone name, or the server's local zone."""
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+def _local(stamp, tz=None):
+    """Return a capture's time in the given time zone (or server's), or None."""
     parsed = library.parse_stamp(stamp)
-    return parsed.astimezone() if parsed else None
+    if not parsed:
+        return None
+    zone = zone_for(tz) if isinstance(tz, str) else tz
+    return parsed.astimezone(zone)
 
 
-def today():
-    """Return today's date in the server's time zone."""
-    return datetime.now().astimezone().date()
+def today(tz=None):
+    """Return today's date in the given time zone (or server's)."""
+    zone = zone_for(tz) if isinstance(tz, str) else tz
+    return datetime.now(timezone.utc).astimezone(zone).date()
 
 
 def parse_day(value):
@@ -89,15 +104,15 @@ def _sample(records, limit):
     return [records[int(i * step)] for i in range(limit)]
 
 
-def lines_for(records, cameras=False):
+def lines_for(records, cameras=False, tz=None):
     """Format a day's described clips as the model is shown them, oldest first.
 
     With `cameras`, each line says which camera it came from, for a summary
     written from several.
     """
-    ordered = sorted(records, key=lambda record: _local(record["stamp"]))
+    ordered = sorted(records, key=lambda record: _local(record["stamp"], tz=tz))
     return [
-        f"{_local(record['stamp']):%H:%M} "
+        f"{_local(record['stamp'], tz=tz):%H:%M} "
         f"{record['camera'] + ': ' if cameras else ''}"
         f"{' '.join(record['summary'].split())}"
         for record in _sample(ordered, config.DAILY_MAX_CLIPS)
@@ -123,14 +138,16 @@ def _tokens(key, records):
 class Daily:
     """The summaries on disk, and whether new ones are being written."""
 
-    def __init__(self, locate=None):
+    def __init__(self, locate=None, timezones=None):
         """Start empty; call load() before serving.
 
         `locate` returns {camera slug: location name} for the cameras Blink
         reports now, under every slug their captures may be filed under.
+        `timezones` returns {slug_or_location_name: timezone_string}.
         """
         self._entries = {}
         self._locate = locate or dict
+        self._timezones = timezones or dict
         self.enabled = config.DAILY_SUMMARIES
         # Whether the summary written each night is also pushed to ntfy.
         self.notify = config.NTFY_DAILY
@@ -215,6 +232,20 @@ class Daily:
 
     # -- reading ----------------------------------------------------------
 
+    def tz_for(self, key):
+        """Return the timezone for a key, or None for server local."""
+        tz_map = self._timezones() if callable(self._timezones) else self._timezones
+        if not tz_map:
+            return None
+        if key in tz_map:
+            return tz_map[key]
+        # If key is a location slug like _location-hall-ave, check location name
+        if kind_of(key) == "location":
+            for held, name in self._locations().values():
+                if held == key and name in tz_map:
+                    return tz_map[name]
+        return None
+
     def _locations(self):
         """Map each camera slug to its location's (key, name)."""
         return {
@@ -242,9 +273,7 @@ class Daily:
         for record in records:
             if record["kind"] != library.MOTION:
                 continue
-            when = _local(record["stamp"])
-            if when is None:
-                continue
+            stamp = record["stamp"]
             keys = [record["slug"], ALL]
             if record["slug"] in locations:
                 keys.append(locations[record["slug"]][0])
@@ -252,6 +281,10 @@ class Daily:
                 if key is not None and held != key:
                     continue
                 if key is None and kind_of(held) not in self.scopes:
+                    continue
+                tz = self.tz_for(held)
+                when = _local(stamp, tz=tz)
+                if when is None:
                     continue
                 days.setdefault((held, when.date().isoformat()), []).append(record)
         return days
@@ -269,7 +302,8 @@ class Daily:
                 if held == key and entry.get("camera"):
                     return entry["camera"]
             return key[len(_LOCATION) :]
-        return max(records, key=lambda r: _local(r["stamp"]))["camera"]
+        tz = self.tz_for(key)
+        return max(records, key=lambda r: _local(r["stamp"], tz=tz))["camera"]
 
     def _day(self, slug, day, records, current):
         """Describe one camera's day the way the UI lists it."""
@@ -298,7 +332,7 @@ class Daily:
         dates.update(day for held, day in self._entries if held == slug)
         dates = [day for day in dates if not before or day < before]
         ordered = sorted(dates, reverse=True)
-        current = today().isoformat()
+        current = today(self.tz_for(slug)).isoformat()
         page = [
             self._day(slug, day, grouped.get((slug, day), []), current)
             for day in ordered[:limit]
@@ -308,7 +342,8 @@ class Daily:
     def day(self, all_records, slug, day):
         """Return one camera's day as days() lists it."""
         records = self._group(all_records, slug).get((slug, day), [])
-        return self._day(slug, day, records, today().isoformat())
+        current = today(self.tz_for(slug)).isoformat()
+        return self._day(slug, day, records, current)
 
     def pending(self, all_records):
         """Return the past days that could have a summary and have none.
@@ -317,9 +352,9 @@ class Daily:
         description backlog drains that way. Today is never one: it is not
         over yet.
         """
-        current = today().isoformat()
         found = []
         for (slug, day), records in self._group(all_records).items():
+            current = today(self.tz_for(slug)).isoformat()
             if day >= current or (slug, day) in self._entries:
                 continue
             described = [record for record in records if record["summary"]]
@@ -360,11 +395,12 @@ class Daily:
                 if kind == "location"
                 else f"Every camera: {', '.join(cameras)}"
             )
+        tz = self.tz_for(slug)
         summary = await vision.summarize_day(
             session,
             camera,
             date.fromisoformat(day),
-            lines_for(described, cameras=group is not None),
+            lines_for(described, cameras=group is not None, tz=tz),
             group=group,
         )
         if not summary:
@@ -394,9 +430,9 @@ class Daily:
             _LOGGER.warning("could not write %s: %s", _path(slug, day), error)
         self._entries[(slug, day)] = entry
         _LOGGER.info("daily: %s on %s: %s", camera, day, summary)
-        return self._day(slug, day, records, today().isoformat())
+        return self._day(slug, day, records, today(tz).isoformat())
 
 
-def yesterday():
-    """Return yesterday's date as YYYY-MM-DD, in the server's time zone."""
-    return (today() - timedelta(days=1)).isoformat()
+def yesterday(tz=None):
+    """Return yesterday's date as YYYY-MM-DD, in the given time zone (or server's)."""
+    return (today(tz) - timedelta(days=1)).isoformat()

@@ -440,12 +440,13 @@ async def summarize_day(request):
             }
         )
     # Today is still happening; a summary of half of it would read as all.
-    if day >= daily.today():
+    slug = request.match_info["slug"]
+    if day >= daily.today(monitor.daily.tz_for(slug)):
         return web.json_response(
             {"status": "error", "message": "That day is not over yet."}
         )
     try:
-        entry = await monitor.summarize_day(request.match_info["slug"], day.isoformat())
+        entry = await monitor.summarize_day(slug, day.isoformat())
     except LookupError:
         return web.json_response(
             {"status": "error", "message": "That day has no descriptions to summarize."}

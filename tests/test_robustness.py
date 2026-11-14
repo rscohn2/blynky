@@ -142,3 +142,39 @@ async def test_credentials_are_private_and_whole(data_dir, monkeypatch):
         await watcher._save_creds()
     assert creds.read_text() == '{"token": "new"}'
     assert not (data_dir / ".creds-test.json.tmp").exists()
+
+
+# ----------------------------------------------------------- daily timezones
+
+
+def test_daily_timezones_grouping():
+    from blynky import daily
+
+    # 2026-11-13 00:44:38 UTC is 2026-11-12 19:44:38 EST (America/New_York)
+    # but 2026-11-13 00:44:38 in UTC
+    records = [
+        {
+            "id": "1",
+            "kind": library.MOTION,
+            "slug": "front-door",
+            "camera": "Front Door",
+            "stamp": "2026-11-13T00:44:38+00:00",
+            "summary": "Someone delivered a package.",
+        }
+    ]
+
+    # Without timezone mapping (default UTC or system)
+    d_utc = daily.Daily(timezones={"front-door": "UTC"})
+    grouped_utc = d_utc._group(records, "front-door")
+    assert ("front-door", "2026-11-13") in grouped_utc
+
+    # With America/New_York timezone
+    d_ny = daily.Daily(timezones={"front-door": "America/New_York"})
+    grouped_ny = d_ny._group(records, "front-door")
+    assert ("front-door", "2026-11-12") in grouped_ny
+    assert ("front-door", "2026-11-13") not in grouped_ny
+
+    # Check lines_for formats the time in local time
+    lines = daily.lines_for(records, tz="America/New_York")
+    assert len(lines) == 1
+    assert lines[0].startswith("19:44 ")

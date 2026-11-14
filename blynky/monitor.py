@@ -154,12 +154,15 @@ class Monitor:
         self._sync_state = {"running": False, "found": 0, "saved": 0, "at": None}
         # A short account of each camera's day, and the runs that write them:
         # the backfill someone started, and yesterday's, written unasked.
-        self.daily = daily.Daily(locate=self._camera_locations)
+        self.daily = daily.Daily(
+            locate=self._camera_locations, timezones=self._camera_timezones
+        )
         self._daily_task = None
         self._daily_run = {"done": 0, "total": 0}
         self._daily_auto = None
-        # The day the unasked run last covered, so it runs once a day.
-        self._daily_covered = None
+        # The day the unasked run last covered for each key, so each runs once a day.
+        # {(key, day)}
+        self._daily_covered = set()
         # One summary at a time, whichever run or button asked for it.
         self._daily_lock = asyncio.Lock()
         self._closing = False
@@ -685,6 +688,15 @@ class Monitor:
             str(network["id"]): network.get("name")
             for network in home.get("networks") or []
             if network.get("id") is not None
+        }
+
+    def _current_system_timezones(self):
+        """Map each system name to the time_zone Blink reports for it."""
+        home = self.blink.homescreen or {}
+        return {
+            network.get("name"): network.get("time_zone")
+            for network in home.get("networks") or []
+            if network.get("name") and network.get("time_zone")
         }
 
     async def _rebuild(self):
@@ -1226,6 +1238,18 @@ class Monitor:
                 found.setdefault(slug, entry["sync"])
         return found
 
+    def _camera_timezones(self):
+        """Map every camera slug, location slug and location name to its timezone."""
+        system_tz = self._current_system_timezones()
+        locations = self._camera_locations()
+        found = dict(system_tz)
+        for name, tz in system_tz.items():
+            found[daily.location_key(name)] = tz
+        for slug, system in locations.items():
+            if system in system_tz:
+                found[slug] = system_tz[system]
+        return found
+
     def daily_status(self, running=None):
         """Return whether summaries are on, and how a backfill stands.
 
@@ -1325,19 +1349,25 @@ class Monitor:
         """Summarize yesterday for every camera, once, when the time comes."""
         if not self.daily.enabled:
             return
-        if datetime.now().astimezone().hour < config.DAILY_HOUR:
-            return
-        day = daily.yesterday()
-        if self._daily_covered == day:
-            return
         if self._daily_auto is not None and not self._daily_auto.done():
             return
-        self._daily_auto = asyncio.create_task(self._run_daily_auto(day))
-
-    async def _run_daily_auto(self, day):
+        now_utc = datetime.now(timezone.utc)
         pending = self.daily.pending(self.library.all())
-        slugs = [slug for slug, held, _ in pending if held == day]
-        for slug in slugs:
+        due = []
+        for slug, day, _ in pending:
+            tz = daily.zone_for(self.daily.tz_for(slug))
+            now_local = now_utc.astimezone(tz)
+            if now_local.hour < config.DAILY_HOUR:
+                continue
+            yesterday_local = (now_local.date() - timedelta(days=1)).isoformat()
+            if day == yesterday_local and (slug, day) not in self._daily_covered:
+                due.append((slug, day))
+        if not due:
+            return
+        self._daily_auto = asyncio.create_task(self._run_daily_auto(due))
+
+    async def _run_daily_auto(self, due):
+        for slug, day in due:
             if self._closing or not self.daily.enabled:
                 return
             try:
@@ -1356,11 +1386,11 @@ class Monitor:
                 raise
             except Exception as error:  # noqa: BLE001 - never end the poll loop
                 _LOGGER.exception("daily: %s on %s failed: %s", slug, day, error)
+            # Covered even if the model failed: retrying every minute would spend
+            # tokens all day, and the day keeps its button for a manual retry.
+            self._daily_covered.add((slug, day))
             await asyncio.sleep(config.DAILY_PAUSE)
-        # Covered even if the model failed: retrying every minute would spend
-        # tokens all day, and the day keeps its button for a manual retry.
-        self._daily_covered = day
-        if slugs:
+        if due:
             self._broadcast_daily()
 
     def start_thumbnails(self):
